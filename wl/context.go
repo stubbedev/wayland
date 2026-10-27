@@ -19,6 +19,7 @@ type Context struct {
 	sockFD    int
 	currentId ProxyId
 	objects   map[ProxyId]Proxy
+	zombies   map[ProxyId]fdEvents
 	fds       []int
 
 	// The compositor requires client-allocated ids to arrive in the order
@@ -82,6 +83,7 @@ func (ctx *Context) RegisterMapped(proxy Proxy, num uint32) {
 	proxy.SetId(ProxyId(num))
 	proxy.SetContext(ctx)
 	ctx.objects[ProxyId(num)] = proxy
+	delete(ctx.zombies, ProxyId(num))
 	ctx.mu.Unlock()
 }
 
@@ -108,6 +110,7 @@ func (ctx *Context) Register(proxy Proxy) {
 		SetUserData(c, &ctx)
 	}
 	ctx.objects[ctx.currentId] = proxy
+	delete(ctx.zombies, ctx.currentId)
 	// The display is the one client-side proxy the compositor already
 	// knows: its id (1) is fixed by the protocol and no request ever
 	// carries it as a new_id. Tracking it as unsent would leave every
@@ -118,14 +121,28 @@ func (ctx *Context) Register(proxy Proxy) {
 	}
 }
 
-// Unregister unregisters a proxy in the map of all Context objects (proxies)
+// Unregister unregisters a proxy in the map of all Context objects (proxies).
+// Until its id is deleted or reused, fds the compositor still sends it are
+// closed instead of reaching another object's event.
 func (ctx *Context) Unregister(id ProxyId) {
 	ctx.mu.Lock()
-	if ctx.objects != nil {
-		delete(ctx.objects, id)
+	if c, ok := ctx.objects[id].(fdEvents); ok {
+		if ctx.zombies == nil {
+			ctx.zombies = make(map[ProxyId]fdEvents)
+		}
+		ctx.zombies[id] = c
 	}
+	delete(ctx.objects, id)
 	ctx.mu.Unlock()
 	ctx.forgetUnsent(id)
+}
+
+type zombieReaper struct{ ctx *Context }
+
+func (r zombieReaper) HandleDisplayDeleteId(ev DisplayDeleteIdEvent) {
+	r.ctx.mu.Lock()
+	delete(r.ctx.zombies, ProxyId(ev.Id))
+	r.ctx.mu.Unlock()
 }
 
 // LookupProxy looks up a specific proxy by it's Id in the map of all Context objects (proxies)
@@ -170,7 +187,13 @@ func Connect(addr string) (ret *Display, err error) {
 	}
 	//DON'T dispatch events in separate goroutine
 	//go c.Run()
-	return NewDisplay(c), nil
+	return c.newDisplay(), nil
+}
+
+func (ctx *Context) newDisplay() *Display {
+	d := NewDisplay(ctx)
+	d.AddDeleteIdHandler(zombieReaper{ctx})
+	return d
 }
 
 var errFoundMyCallback = errors.New("run found my callback")
@@ -221,7 +244,7 @@ var ErrContextNil = errors.New("context is nil")
 // it wants to run, another thread probably cannot close it safely
 var ErrContextConnNil = errors.New("context conn is nil")
 
-func (ctx *Context) run(cb *Callback) error {
+func (ctx *Context) run(cb *Callback) (err error) {
 	// ctx := context.Background()
 
 	if ctx == nil {
@@ -242,6 +265,14 @@ func (ctx *Context) run(cb *Callback) error {
 	}
 
 	proxy := ctx.LookupProxy(ev.Pid)
+	if err := ctx.claimFDs(ev, proxy); err != nil {
+		return combinedError{ErrContextRunProtocolError, err}
+	}
+	defer func() {
+		if cerr := ev.closeUnclaimedFDs(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}()
 	if proxy != nil {
 		if dispatcher, ok := proxy.(Dispatcher); dispatcher != nil && ok {
 			if foundCb, ok := dispatcher.(*Callback); ok {
@@ -285,6 +316,7 @@ func (ctx *Context) Close() (err error) {
 		}
 	*/
 	ctx.objects = nil
+	ctx.zombies = nil
 	for _, fd := range ctx.fds {
 		err = errors.Join(err, sys.Close(fd))
 	}

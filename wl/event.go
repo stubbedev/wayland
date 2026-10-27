@@ -3,6 +3,7 @@ package wl
 import (
 	"bytes"
 	"errors"
+	"fmt"
 
 	"github.com/neurlang/wayland/os"
 	"github.com/yalue/native_endian"
@@ -15,7 +16,7 @@ type Event struct {
 	Data   []byte
 	off    int
 	err    error
-	ctx    *Context
+	fds    []int
 }
 
 // ErrReadHeader (Error unable to read message header) is returned when it is not possible to read enough bytes from the unix socket,
@@ -58,7 +59,6 @@ func (ctx *Context) readEvent() (*Event, error) {
 		return nil, ErrSizeOfHeaderWrong
 	}
 	ev := new(Event)
-	ev.ctx = ctx
 	ev.Pid = ProxyId(native_endian.NativeEndian().Uint32(buf[0:4]))
 	ev.Opcode = uint32(native_endian.NativeEndian().Uint16(buf[4:6]))
 	size := uint32(native_endian.NativeEndian().Uint16(buf[6:8]))
@@ -120,34 +120,68 @@ func (ctx *Context) queueFDs(control []byte) error {
 	return closeErr
 }
 
-func (ctx *Context) popFD() (int, bool) {
+type fdEvents interface {
+	EventFDs(opcode uint32) int
+}
+
+func (ctx *Context) eventFDCount(ev *Event, proxy Proxy) int {
+	if proxy != nil {
+		if c, ok := proxy.(fdEvents); ok {
+			return c.EventFDs(ev.Opcode)
+		}
+		return 0
+	}
+	ctx.mu.RLock()
+	c, ok := ctx.zombies[ev.Pid]
+	ctx.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return c.EventFDs(ev.Opcode)
+}
+
+func (ctx *Context) claimFDs(ev *Event, proxy Proxy) error {
+	n := ctx.eventFDCount(ev, proxy)
+	if n == 0 {
+		return nil
+	}
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if len(ctx.fds) == 0 {
-		return 0, false
+	if len(ctx.fds) < n {
+		return fmt.Errorf("event %d of object %d carries %d fds, %d arrived: %w", ev.Opcode, ev.Pid, n, len(ctx.fds), ErrNoControlMsgs)
 	}
-	fd := ctx.fds[0]
-	ctx.fds = ctx.fds[1:]
-	return fd, true
+	ev.fds = ctx.fds[:n:n]
+	ctx.fds = ctx.fds[n:]
+	return nil
+}
+
+func (ev *Event) closeUnclaimedFDs() error {
+	var err error
+	for _, fd := range ev.fds {
+		err = errors.Join(err, os.Close(fd))
+	}
+	ev.fds = nil
+	return err
 }
 
 // ErrNoControlMsgs (Error no socket control messages) is returned when an
-// event carries an fd argument but no fd arrived for it
+// event carries more fd arguments than fds arrived for it
 var ErrNoControlMsgs = errors.New("no socket control messages")
 
 // ErrUnableToParseUnixRights (Error unable to parse unix rights)
 var ErrUnableToParseUnixRights = errors.New("unable to parse unix rights")
 
-// FD (Event FD) takes the next received file descriptor, the one belonging
-// to this event's fd argument, and an optional error
+// FD (Event FD) takes this event's next file descriptor, which the caller
+// then owns, and an optional error
 func (ev *Event) FD() (uintptr, error) {
 	if ev.err != nil {
 		return 0, ev.err
 	}
-	fd, ok := ev.ctx.popFD()
-	if !ok {
+	if len(ev.fds) == 0 {
 		return 0, ErrNoControlMsgs
 	}
+	fd := ev.fds[0]
+	ev.fds = ev.fds[1:]
 	return uintptr(fd), nil
 }
 

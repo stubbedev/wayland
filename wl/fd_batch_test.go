@@ -8,6 +8,7 @@ import (
 	"os"
 	"syscall"
 	"testing"
+	"time"
 )
 
 type sendRecorder []DataSourceSendEvent
@@ -22,6 +23,11 @@ func newSocketContext(t *testing.T) (*Context, int) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return socketContext(t, fds)
+}
+
+func socketContext(t testing.TB, fds [2]int) (*Context, int) {
+	t.Helper()
 	t.Cleanup(func() { syscall.Close(fds[1]) })
 	f := os.NewFile(uintptr(fds[0]), "client")
 	conn, err := net.FileConn(f)
@@ -133,6 +139,96 @@ func TestCloseClosesFDsNoEventTook(t *testing.T) {
 	}
 	if _, err := fcntlGetFD(unused); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("fd %d no event took is still open after Close (fcntl: %v)", unused, err)
+	}
+}
+
+func openFDs(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(entries)
+}
+
+func assertOwnFD(t *testing.T, ev DataSourceSendEvent, own *os.File) {
+	t.Helper()
+	if ev.FdError != nil {
+		t.Fatal(ev.FdError)
+	}
+	w := os.NewFile(ev.Fd, "received")
+	_, err := w.Write([]byte{1})
+	w.Close()
+	if err != nil {
+		t.Fatalf("write to the event's fd: %v", err)
+	}
+	if err := own.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(own, make([]byte, 1)); err != nil {
+		t.Fatalf("the event got another event's fd: its own pipe read %v", err)
+	}
+}
+
+func TestUnhandledFDEventLeavesLaterFDsAligned(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		destroy bool
+		runErr  error
+	}{
+		{name: "no handler"},
+		{name: "destroyed object", destroy: true, runErr: ErrContextRunProxyNil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, sock := newSocketContext(t)
+			other := NewDataSource(ctx)
+			src := NewDataSource(ctx)
+			var got sendRecorder
+			src.AddSendHandler(&got)
+			if tc.destroy {
+				other.Unregister()
+			}
+			readers, writers := pipes(t, 2)
+			before := openFDs(t)
+			compositorFlush(t, sock, [][]byte{dataSourceSend(other.Id(), "text/plain")}, writers[:1])
+			if err := ctx.Run(); !errors.Is(err, tc.runErr) {
+				t.Fatalf("run of the unhandled event: %v, want %v", err, tc.runErr)
+			}
+			if after := openFDs(t); after != before {
+				t.Fatalf("%d fds open after the unhandled event, %d before", after, before)
+			}
+			compositorFlush(t, sock, [][]byte{dataSourceSend(src.Id(), "text/plain")}, writers[1:])
+			if err := ctx.Run(); err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("dispatched %d send events, want 1", len(got))
+			}
+			assertOwnFD(t, got[0], readers[1])
+		})
+	}
+}
+
+func TestDeleteIdReleasesADestroyedObject(t *testing.T) {
+	ctx, sock := newSocketContext(t)
+	ctx.newDisplay()
+	src := NewDataSource(ctx)
+	src.Unregister()
+	if _, ok := ctx.zombies[src.Id()]; !ok {
+		t.Fatal("a destroyed data source is not kept until its id is deleted")
+	}
+	msg := make([]byte, 12)
+	binary.NativeEndian.PutUint32(msg[0:], 1)
+	binary.NativeEndian.PutUint32(msg[4:], uint32(len(msg))<<16|1)
+	binary.NativeEndian.PutUint32(msg[8:], uint32(src.Id()))
+	if _, err := syscall.Write(sock, msg); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ctx.zombies[src.Id()]; ok {
+		t.Fatal("wl_display.delete_id left the destroyed data source behind")
 	}
 }
 
