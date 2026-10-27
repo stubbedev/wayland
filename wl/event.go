@@ -25,7 +25,7 @@ var ErrReadHeader = errors.New("unable to read message header")
 // ErrSizeOfHeaderWrong (Error size of message header is wrong) is returned when the returned size of message heaer is not 8 bytes
 var ErrSizeOfHeaderWrong = errors.New("size of message header is wrong")
 
-// ErrControlMsgBuffer (Error insufficient control msg buffer) is returned when the oobn is bigger than the control message buffer
+// ErrControlMsgBuffer (Error insufficient control msg buffer) is returned when the kernel discarded control data, and the fds in it, for lack of buffer space
 var ErrControlMsgBuffer = errors.New("insufficient control msg buffer")
 
 // ErrControlMsgParseError (Error control message parse error) is returned when the unix socket control message cannot be parsed, use
@@ -39,15 +39,18 @@ var ErrInvalidMsgSize = errors.New("invalid message size")
 // underlying cause and GetExternal to get this cause
 var ErrReadPayload = errors.New("cannot read message")
 
-func (ctx *Context) readEvent() (*Event, error) {
-	buf := bytePool.Take(8)
-	control := bytePool.Take(24)
+const libwaylandMaxFDsOut = 28
 
+var controlLen = os.CmsgSpace(libwaylandMaxFDsOut * 4)
+
+func (ctx *Context) readEvent() (*Event, error) {
 	if ctx.conn == nil {
 		return nil, ErrContextConnNil
 	}
 
-	n, oobn, _, _, err := ctx.conn.ReadMsgUnix(buf[:], control)
+	buf := bytePool.Take(8)
+	defer bytePool.Give(buf)
+	n, err := ctx.read(buf)
 	if err != nil {
 		return nil, combinedError{ErrReadHeader, err}
 	}
@@ -56,66 +59,96 @@ func (ctx *Context) readEvent() (*Event, error) {
 	}
 	ev := new(Event)
 	ev.ctx = ctx
-	if oobn > 0 {
-		if oobn > len(control) {
-			return nil, ErrControlMsgBuffer
-		}
-		scms, err := os.ParseSocketControlMessage(control[:oobn])
-		if err != nil {
-			return nil, combinedError{ErrControlMsgParseError, err}
-		}
-		// The parsed messages' Data slices point into control, which goes
-		// back to bytePool below and is reused by the next read. A queued
-		// fd would then decode from whatever that read left there, so keep
-		// copies.
-		for i := range scms {
-			scms[i].Data = append([]byte(nil), scms[i].Data...)
-		}
-		ctx.scms = append(ctx.scms, scms...)
-	}
-
 	ev.Pid = ProxyId(native_endian.NativeEndian().Uint32(buf[0:4]))
 	ev.Opcode = uint32(native_endian.NativeEndian().Uint16(buf[4:6]))
 	size := uint32(native_endian.NativeEndian().Uint16(buf[6:8]))
 
-	// subtract 8 bytes from header
 	data := bytePool.Take(int(size) - 8)
-	n, err = ctx.conn.Read(data)
-	if err != nil {
-		return nil, combinedError{ErrReadPayload, err}
-	}
-	if n != int(size)-8 {
-		return nil, ErrInvalidMsgSize
+	if len(data) > 0 {
+		n, err = ctx.read(data)
+		if err != nil {
+			return nil, combinedError{ErrReadPayload, err}
+		}
+		if n != len(data) {
+			return nil, ErrInvalidMsgSize
+		}
 	}
 	ev.Data = data
-
-	bytePool.Give(buf)
-	bytePool.Give(control)
 
 	return ev, nil
 }
 
-// ErrNoControlMsgs (Error no socket control messages)
+func (ctx *Context) read(b []byte) (int, error) {
+	control := bytePool.Take(controlLen)
+	defer bytePool.Give(control)
+	n, oobn, flags, _, err := ctx.conn.ReadMsgUnix(b, control)
+	if oobn > 0 {
+		if qerr := ctx.queueFDs(control[:oobn]); qerr != nil {
+			return n, qerr
+		}
+	}
+	if err != nil {
+		return n, err
+	}
+	if flags&os.MsgCtrunc != 0 {
+		return n, ErrControlMsgBuffer
+	}
+	return n, nil
+}
+
+func (ctx *Context) queueFDs(control []byte) error {
+	scms, err := os.ParseSocketControlMessage(control)
+	if err != nil {
+		return combinedError{ErrControlMsgParseError, err}
+	}
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	var closeErr error
+	for i := range scms {
+		fds, err := os.ParseUnixRights(&scms[i])
+		if err != nil {
+			return combinedError{ErrUnableToParseUnixRights, err}
+		}
+		if ctx.conn != nil {
+			ctx.fds = append(ctx.fds, fds...)
+			continue
+		}
+		for _, fd := range fds {
+			closeErr = errors.Join(closeErr, os.Close(fd))
+		}
+	}
+	return closeErr
+}
+
+func (ctx *Context) popFD() (int, bool) {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	if len(ctx.fds) == 0 {
+		return 0, false
+	}
+	fd := ctx.fds[0]
+	ctx.fds = ctx.fds[1:]
+	return fd, true
+}
+
+// ErrNoControlMsgs (Error no socket control messages) is returned when an
+// event carries an fd argument but no fd arrived for it
 var ErrNoControlMsgs = errors.New("no socket control messages")
 
 // ErrUnableToParseUnixRights (Error unable to parse unix rights)
 var ErrUnableToParseUnixRights = errors.New("unable to parse unix rights")
 
-// FD (Event FD) extracts the file descriptor and an optional error
+// FD (Event FD) takes the next received file descriptor, the one belonging
+// to this event's fd argument, and an optional error
 func (ev *Event) FD() (uintptr, error) {
 	if ev.err != nil {
 		return 0, ev.err
 	}
-	if len(ev.ctx.scms) == 0 {
+	fd, ok := ev.ctx.popFD()
+	if !ok {
 		return 0, ErrNoControlMsgs
 	}
-	fds, err := os.ParseUnixRights(&ev.ctx.scms[0])
-	if err != nil {
-		return 0, ErrUnableToParseUnixRights
-	}
-	//TODO: is this required??????????????
-	ev.ctx.scms = ev.ctx.scms[1:]
-	return uintptr(fds[0]), nil
+	return uintptr(fd), nil
 }
 
 // ErrUnableToParseUint32 (Error unable to read unsigned int) is returned when the buffer is too short to contain a specific unsigned int

@@ -19,7 +19,7 @@ type Context struct {
 	sockFD    int
 	currentId ProxyId
 	objects   map[ProxyId]Proxy
-	scms      []sys.SocketControlMessage
+	fds       []int
 
 	// The compositor requires client-allocated ids to arrive in the order
 	// they were allocated: libwayland's wl_map rejects a new id that is
@@ -285,7 +285,10 @@ func (ctx *Context) Close() (err error) {
 		}
 	*/
 	ctx.objects = nil
-	ctx.scms = nil
+	for _, fd := range ctx.fds {
+		err = errors.Join(err, sys.Close(fd))
+	}
+	ctx.fds = nil
 	ctx.mu.Unlock()
 	CleanContextData(ctx)
 	return err
