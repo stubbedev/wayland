@@ -23,9 +23,6 @@ type Event struct {
 // use Unwrap() to get the underlying cause and GetExternal to get this cause
 var ErrReadHeader = errors.New("unable to read message header")
 
-// ErrSizeOfHeaderWrong (Error size of message header is wrong) is returned when the returned size of message heaer is not 8 bytes
-var ErrSizeOfHeaderWrong = errors.New("size of message header is wrong")
-
 // ErrControlMsgBuffer (Error insufficient control msg buffer) is returned when the kernel discarded control data, and the fds in it, for lack of buffer space
 var ErrControlMsgBuffer = errors.New("insufficient control msg buffer")
 
@@ -33,14 +30,18 @@ var ErrControlMsgBuffer = errors.New("insufficient control msg buffer")
 // Unwrap() to get the underlying cause and GetExternal to get this cause
 var ErrControlMsgParseError = errors.New("control message parse error")
 
-// ErrInvalidMsgSize (Error invalid message size) is returned when the payload message size read from the unix socket is incorrect
+// ErrInvalidMsgSize (Error invalid message size) is returned when a message header declares a size smaller than the header
 var ErrInvalidMsgSize = errors.New("invalid message size")
 
 // ErrReadPayload (Error cannot read message) is returned when the payload message cannot be read, use Unwrap() to get the
 // underlying cause and GetExternal to get this cause
 var ErrReadPayload = errors.New("cannot read message")
 
-const libwaylandMaxFDsOut = 28
+const (
+	libwaylandMaxFDsOut = 28
+	inBufferSize        = 4096
+	headerSize          = 8
+)
 
 var controlLen = os.CmsgSpace(libwaylandMaxFDsOut * 4)
 
@@ -48,42 +49,55 @@ func (ctx *Context) readEvent() (*Event, error) {
 	if ctx.conn == nil {
 		return nil, ErrContextConnNil
 	}
-
-	buf := bytePool.Take(8)
-	defer bytePool.Give(buf)
-	n, err := ctx.read(buf)
+	header, err := ctx.fill(headerSize)
 	if err != nil {
 		return nil, combinedError{ErrReadHeader, err}
 	}
-	if n != 8 {
-		return nil, ErrSizeOfHeaderWrong
+	size := int(native_endian.NativeEndian().Uint16(header[6:8]))
+	if size < headerSize {
+		return nil, ErrInvalidMsgSize
 	}
-	ev := new(Event)
-	ev.Pid = ProxyId(native_endian.NativeEndian().Uint32(buf[0:4]))
-	ev.Opcode = uint32(native_endian.NativeEndian().Uint16(buf[4:6]))
-	size := uint32(native_endian.NativeEndian().Uint16(buf[6:8]))
+	msg, err := ctx.fill(size)
+	if err != nil {
+		return nil, combinedError{ErrReadPayload, err}
+	}
+	ctx.inStart += size
+	return &Event{
+		Pid:    ProxyId(native_endian.NativeEndian().Uint32(msg[0:4])),
+		Opcode: uint32(native_endian.NativeEndian().Uint16(msg[4:6])),
+		Data:   msg[headerSize:],
+	}, nil
+}
 
-	data := bytePool.Take(int(size) - 8)
-	if len(data) > 0 {
-		n, err = ctx.read(data)
+func (ctx *Context) fill(n int) ([]byte, error) {
+	for len(ctx.in)-ctx.inStart < n {
+		if ctx.inStart > 0 {
+			ctx.in = ctx.in[:copy(ctx.in, ctx.in[ctx.inStart:])]
+			ctx.inStart = 0
+		}
+		if cap(ctx.in) < n || cap(ctx.in) == len(ctx.in) {
+			grown := make([]byte, len(ctx.in), max(n, inBufferSize))
+			copy(grown, ctx.in)
+			ctx.in = grown
+		}
+		m, err := ctx.read(ctx.in[len(ctx.in):cap(ctx.in)])
+		if m > 0 {
+			ctx.in = ctx.in[:len(ctx.in)+m]
+		}
 		if err != nil {
-			return nil, combinedError{ErrReadPayload, err}
-		}
-		if n != len(data) {
-			return nil, ErrInvalidMsgSize
+			return nil, err
 		}
 	}
-	ev.Data = data
-
-	return ev, nil
+	return ctx.in[ctx.inStart : ctx.inStart+n], nil
 }
 
 func (ctx *Context) read(b []byte) (int, error) {
-	control := bytePool.Take(controlLen)
-	defer bytePool.Give(control)
-	n, oobn, flags, _, err := ctx.conn.ReadMsgUnix(b, control)
+	if ctx.control == nil {
+		ctx.control = make([]byte, controlLen)
+	}
+	n, oobn, flags, _, err := ctx.conn.ReadMsgUnix(b, ctx.control)
 	if oobn > 0 {
-		if qerr := ctx.queueFDs(control[:oobn]); qerr != nil {
+		if qerr := ctx.queueFDs(ctx.control[:oobn]); qerr != nil {
 			return n, qerr
 		}
 	}

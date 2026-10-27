@@ -21,6 +21,9 @@ type Context struct {
 	objects   map[ProxyId]Proxy
 	zombies   map[ProxyId]fdEvents
 	fds       []int
+	in        []byte
+	inStart   int
+	control   []byte
 
 	// The compositor requires client-allocated ids to arrive in the order
 	// they were allocated: libwayland's wl_map rejects a new id that is
@@ -277,12 +280,10 @@ func (ctx *Context) run(cb *Callback) (err error) {
 		if dispatcher, ok := proxy.(Dispatcher); dispatcher != nil && ok {
 			if foundCb, ok := dispatcher.(*Callback); ok {
 				if foundCb == cb {
-					bytePool.Give(ev.Data)
 					return errFoundMyCallback
 				}
 			}
 			dispatcher.Dispatch(ev)
-			bytePool.Give(ev.Data)
 
 			if ev.err != nil {
 				return combinedError{ErrContextRunProtocolError, ev.err}
